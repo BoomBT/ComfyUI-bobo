@@ -2,90 +2,87 @@
 # 目标:BoomBT/ComfyUI-bobo 每 12 小时自动追平 Comfy-Org/ComfyUI,无人值守。
 # 2026-09-07 comfyui-manager 建。
 #
-# 🔴 这个文件就是**同步器自己**。上游没有同名文件,所以正常情况下永远不会冲突;
-#    真冲突了,下面的兜底是 `git merge --abort` 而**不是** `reset --hard upstream`——
-#    宁可这次不同步、发一封失败邮件,也绝不能把同步器自己冲掉:那等于自杀,
-#    从此再没有下一次运行,而且没人会发现它已经死了。
+# 🔴 为什么不用 `git merge + git push`(第一版就是那么写的,真跑当场炸了,别再改回去):
+#     GITHUB_TOKEN 属于 GitHub App 身份,GitHub **硬性拒绝** App 推送任何带
+#     `.github/workflows/` 变更的提交,报:
+#       "refusing to allow a GitHub App to create or update workflow ... without `workflows` permission"
+#     而 workflow 里的 `permissions:` 块**根本没有 `workflows` 这一项**可声明 —— 无解。
+#     上游 ComfyUI 隔三差五就改自己的 CI 文件,所以那条路必然在某次同步时静静炸掉。
 #
-# 为什么用默认 GITHUB_TOKEN 而不是 PAT(两条都是硬理由,别改):
-#   ① PAT 会过期 —— 过期那天这条链就无声无息地死了,正是要避免的事;
-#      GITHUB_TOKEN 由 Actions 每次运行现发,永不过期、不用人管。
-#   ② GITHUB_TOKEN 推的提交**不会触发**其它 workflow(GitHub 的防循环规则)。
-#      本 fork 从上游继承了 27 个 CI workflow,若换成 PAT,每次同步都会把它们
-#      全炸一遍 —— 天天收失败邮件,等于给自己装了个噪音发生器。
+# ✅ 改用 GitHub 官方的 fork 同步端点 POST /repos/{owner}/{repo}/merge-upstream:
+#     由 GitHub 服务端直接做合并,不经过 git push,因此不受上面那条 App 限制;
+#     顺带还省掉 checkout 整个 97MB 仓库,一次同步 2 秒完事。
 #
 # 为什么 cron 不用整点:GitHub 的 schedule 在整点排队最重、延迟能到几十分钟,
-#   错开到 :17 分基本能准时。UTC 01:17 / 13:17 = 北京 09:17 / 21:17。
+#     错开到 :17 分基本能准时。UTC 01:17 / 13:17 = 北京 09:17 / 21:17。
+#
+# 关于 tag:merge-upstream 只同步分支不同步 tag。这不影响使用 —— 本地那份
+#     D:\ComfyUIApi\ComfyUI-next 同时挂了 origin(本 fork) 和 upstream(官方仓),
+#     要 checkout v0.34.5 这种稳定版直接 `git fetch upstream --tags` 即可。
 
 name: 同步上游 ComfyUI
 
 on:
   schedule:
     - cron: '17 1,13 * * *'
-  workflow_dispatch: # 手动点一下立刻同步,不用等到点
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '要同步的分支(自测用,平时留空即 master)'
+        required: false
+        default: 'master'
 
 permissions:
   contents: write
 
 concurrency:
   group: sync-upstream
-  cancel-in-progress: false # 同步跑到一半被掐可能留下半拉状态,让它跑完
+  cancel-in-progress: false
 
 jobs:
   sync:
     # 防止别人再 fork 走本仓后,在他们那边空跑一堆失败任务
     if: github.repository == 'BoomBT/ComfyUI-bobo'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BRANCH: ${{ github.event.inputs.branch || 'master' }}
 
     steps:
-      - name: 取回本仓完整历史
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0 # merge 要完整历史,浅克隆会直接失败
-          persist-credentials: true # 后面 push 靠它带的 GITHUB_TOKEN
-
       - name: 追平上游
         run: |
           set -euo pipefail
-          git config user.name  'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 
-          git remote add upstream https://github.com/Comfy-Org/ComfyUI.git 2>/dev/null \
-            || git remote set-url upstream https://github.com/Comfy-Org/ComfyUI.git
-          git fetch upstream master --tags --force
-
-          BEFORE=$(git rev-parse HEAD)
-
-          if git merge --no-edit upstream/master; then
-            AFTER=$(git rev-parse HEAD)
-            if [ "$BEFORE" != "$AFTER" ]; then
-              git push origin HEAD:master
-              echo "✅ 已同步 ${BEFORE:0:8} → ${AFTER:0:8}"
-            else
-              echo "✅ 已经是最新,无需同步"
-            fi
+          # merge_type: fast-forward = 有更新已拉平 / none = 本来就是最新 / merge = 本仓有自己的提交,做了合并
+          if RESP=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+                      -f branch="$BRANCH" 2>&1); then
+            echo "$RESP"
+            echo "✅ 分支 $BRANCH 已追平上游"
           else
-            git merge --abort || true
-            echo "::error::与上游冲突,本次未同步。同步器本身完好、下次照常运行,但需要人工处理冲突。"
+            echo "$RESP"
+            # 409 = 与上游冲突,必须人工处理。这里**只报错不硬来**:
+            # 绝不能为了"跑绿"去 force reset,那会把本仓自己的东西(含本同步器)冲掉 = 自杀。
+            echo "::error::同步失败(多半是与上游冲突,需人工处理)。同步器本身完好,下次照常运行。"
             exit 1
           fi
-
-          # tag 也要跟上 —— 本地是靠 tag 去 checkout 稳定版(v0.34.5 这种),没 tag 就只能吃 master
-          git push origin --tags
 
       - name: 保活(防 60 天无活动被 GitHub 停掉 schedule)
         run: |
           set -euo pipefail
-          # GitHub 会把「60 天没有活动」的仓库里的 scheduled workflow 自动禁用。
-          # 上游 ComfyUI 一天提交好几次,正常永远轮不到这一步 —— 这纯粹是兜底:
-          # 万一哪天上游停更两个月,这条链会在没人察觉的情况下被 GitHub 关掉。
-          LAST=$(git log -1 --format=%ct)
-          NOW=$(date +%s)
-          DAYS=$(( (NOW - LAST) / 86400 ))
-          echo "距上次提交 ${DAYS} 天(≥50 天就打一个空提交保活)"
+          # GitHub 会把「60 天没有活动」的仓库里的 scheduled workflow 自动禁用 —— 那时这条链会
+          # 无声无息地死掉,没人会发现。上游 ComfyUI 一天提交好几次,正常永远轮不到这一步,
+          # 这纯粹是兜底:万一上游停更两个月,靠这个空文件的时间戳把仓库"戳活"。
+          LAST_ISO=$(gh api "repos/${GITHUB_REPOSITORY}/commits?per_page=1" --jq '.[0].commit.committer.date')
+          DAYS=$(( ( $(date +%s) - $(date -d "$LAST_ISO" +%s) ) / 86400 ))
+          echo "距上次提交 ${DAYS} 天(≥50 天才需要保活)"
+
           if [ "$DAYS" -ge 50 ]; then
-            git commit --allow-empty -m "chore: keepalive(防 schedule 被 60 天无活动规则禁用)"
-            git push origin HEAD:master
-            echo "已打保活提交"
+            SHA=$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/.keepalive" --jq '.sha' 2>/dev/null || true)
+            ARGS=(-f message="chore: keepalive(防 schedule 被 60 天无活动规则禁用)"
+                  -f content="$(date -u +%FT%TZ | base64 -w0)"
+                  -f branch="$BRANCH")
+            [ -n "$SHA" ] && ARGS+=(-f sha="$SHA")
+            gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/.github/.keepalive" "${ARGS[@]}" --silent
+            echo "已打保活戳"
           fi
