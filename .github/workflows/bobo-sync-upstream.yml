@@ -1,0 +1,91 @@
+# ── fork 自动跟随上游 ───────────────────────────────────────────────────────
+# 目标:BoomBT/ComfyUI-bobo 每 12 小时自动追平 Comfy-Org/ComfyUI,无人值守。
+# 2026-09-07 comfyui-manager 建。
+#
+# 🔴 这个文件就是**同步器自己**。上游没有同名文件,所以正常情况下永远不会冲突;
+#    真冲突了,下面的兜底是 `git merge --abort` 而**不是** `reset --hard upstream`——
+#    宁可这次不同步、发一封失败邮件,也绝不能把同步器自己冲掉:那等于自杀,
+#    从此再没有下一次运行,而且没人会发现它已经死了。
+#
+# 为什么用默认 GITHUB_TOKEN 而不是 PAT(两条都是硬理由,别改):
+#   ① PAT 会过期 —— 过期那天这条链就无声无息地死了,正是要避免的事;
+#      GITHUB_TOKEN 由 Actions 每次运行现发,永不过期、不用人管。
+#   ② GITHUB_TOKEN 推的提交**不会触发**其它 workflow(GitHub 的防循环规则)。
+#      本 fork 从上游继承了 27 个 CI workflow,若换成 PAT,每次同步都会把它们
+#      全炸一遍 —— 天天收失败邮件,等于给自己装了个噪音发生器。
+#
+# 为什么 cron 不用整点:GitHub 的 schedule 在整点排队最重、延迟能到几十分钟,
+#   错开到 :17 分基本能准时。UTC 01:17 / 13:17 = 北京 09:17 / 21:17。
+
+name: 同步上游 ComfyUI
+
+on:
+  schedule:
+    - cron: '17 1,13 * * *'
+  workflow_dispatch: # 手动点一下立刻同步,不用等到点
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false # 同步跑到一半被掐可能留下半拉状态,让它跑完
+
+jobs:
+  sync:
+    # 防止别人再 fork 走本仓后,在他们那边空跑一堆失败任务
+    if: github.repository == 'BoomBT/ComfyUI-bobo'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 取回本仓完整历史
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # merge 要完整历史,浅克隆会直接失败
+          persist-credentials: true # 后面 push 靠它带的 GITHUB_TOKEN
+
+      - name: 追平上游
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream https://github.com/Comfy-Org/ComfyUI.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/Comfy-Org/ComfyUI.git
+          git fetch upstream master --tags --force
+
+          BEFORE=$(git rev-parse HEAD)
+
+          if git merge --no-edit upstream/master; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" != "$AFTER" ]; then
+              git push origin HEAD:master
+              echo "✅ 已同步 ${BEFORE:0:8} → ${AFTER:0:8}"
+            else
+              echo "✅ 已经是最新,无需同步"
+            fi
+          else
+            git merge --abort || true
+            echo "::error::与上游冲突,本次未同步。同步器本身完好、下次照常运行,但需要人工处理冲突。"
+            exit 1
+          fi
+
+          # tag 也要跟上 —— 本地是靠 tag 去 checkout 稳定版(v0.34.5 这种),没 tag 就只能吃 master
+          git push origin --tags
+
+      - name: 保活(防 60 天无活动被 GitHub 停掉 schedule)
+        run: |
+          set -euo pipefail
+          # GitHub 会把「60 天没有活动」的仓库里的 scheduled workflow 自动禁用。
+          # 上游 ComfyUI 一天提交好几次,正常永远轮不到这一步 —— 这纯粹是兜底:
+          # 万一哪天上游停更两个月,这条链会在没人察觉的情况下被 GitHub 关掉。
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "距上次提交 ${DAYS} 天(≥50 天就打一个空提交保活)"
+          if [ "$DAYS" -ge 50 ]; then
+            git commit --allow-empty -m "chore: keepalive(防 schedule 被 60 天无活动规则禁用)"
+            git push origin HEAD:master
+            echo "已打保活提交"
+          fi
